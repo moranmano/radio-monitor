@@ -1,0 +1,159 @@
+import logging
+import tempfile
+import time
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import desc, select
+
+from app.config import get_settings
+from app.database import SessionLocal
+from app.models import Ad, Detection, SettingsModel
+from app.services.audio_matcher import AudioMatcher
+from app.services.email_service import send_detection_email
+from app.services.report_service import send_yesterday_report
+from app.services.storage_service import get_public_url, upload_bytes
+from app.services.stream_service import capture_stream_window, cut_evidence
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
+settings = get_settings()
+matcher = AudioMatcher()
+
+
+def get_runtime_settings(db):
+    row = db.get(SettingsModel, 1)
+    stream_url = row.stream_url if row else settings.stream_url
+    report_email = row.report_email if row else settings.default_report_email
+    match_threshold = row.match_threshold if row else settings.match_threshold
+    dedup_minutes = row.dedup_minutes if row else settings.dedup_minutes
+    backup_urls = []
+    if row and row.stream_backup_urls:
+        backup_urls = [x.strip() for x in row.stream_backup_urls.split(',') if x.strip()]
+    elif settings.backup_stream_urls:
+        backup_urls = settings.backup_stream_urls
+    return stream_url, backup_urls, report_email, match_threshold, dedup_minutes
+
+
+def should_skip_due_to_dedup(db, ad_id, dedup_minutes: int) -> bool:
+    latest = db.execute(
+        select(Detection).where(Detection.ad_id == ad_id).order_by(desc(Detection.detected_at)).limit(1)
+    ).scalar_one_or_none()
+    if latest is None:
+        return False
+    now = datetime.now(ZoneInfo(settings.timezone))
+    return latest.detected_at >= now - timedelta(minutes=dedup_minutes)
+
+
+def process_once():
+    db = SessionLocal()
+    try:
+        stream_url, backup_urls, report_email, match_threshold, dedup_minutes = get_runtime_settings(db)
+        ads = db.execute(select(Ad).where(Ad.is_active.is_(True))).scalars().all()
+        if not ads:
+            logger.info('No active ads found, waiting...')
+            return
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            window_path = str(Path(tmpdir) / 'window.wav')
+            selected_url = None
+            for candidate in [stream_url, *backup_urls]:
+                try:
+                    capture_stream_window(candidate, settings.monitor_window_seconds, window_path)
+                    selected_url = candidate
+                    break
+                except Exception as exc:
+                    logger.warning('Stream candidate failed: %s | %s', candidate, exc)
+            if selected_url is None:
+                logger.error('All stream URLs failed in this cycle')
+                return
+
+            with open(window_path, 'rb') as f:
+                window_bytes = f.read()
+
+            best = None
+            for ad in ads:
+                if not ad.fingerprint_json:
+                    continue
+                result = matcher.compare_fingerprint_to_window(ad.fingerprint_json, window_bytes)
+                if best is None or result.confidence > best['confidence']:
+                    best = {
+                        'ad': ad,
+                        'confidence': result.confidence,
+                    }
+
+            if not best:
+                logger.info('No match candidates this cycle')
+                return
+
+            if best['confidence'] < match_threshold:
+                logger.info('Best confidence %.3f below threshold %.3f', best['confidence'], match_threshold)
+                return
+
+            ad = best['ad']
+            if should_skip_due_to_dedup(db, ad.id, dedup_minutes):
+                logger.info('Skipped due to dedup for ad %s', ad.name)
+                return
+
+            evidence_mp3 = str(Path(tmpdir) / 'evidence.mp3')
+            cut_evidence(window_path, evidence_mp3, start_seconds=0, duration_seconds=settings.monitor_window_seconds)
+            with open(evidence_mp3, 'rb') as f:
+                evidence_bytes = f.read()
+
+            evidence_path = f"evidence/{datetime.now().strftime('%Y/%m/%d')}/{uuid.uuid4()}.mp3"
+            upload_bytes(settings.supabase_evidence_bucket, evidence_path, evidence_bytes, 'audio/mpeg')
+            evidence_public_url = get_public_url(settings.supabase_evidence_bucket, evidence_path)
+
+            detected_at = datetime.now(ZoneInfo(settings.timezone))
+            detection = Detection(
+                ad_id=ad.id,
+                ad_name_snapshot=ad.name,
+                detected_at=detected_at,
+                confidence=best['confidence'],
+                evidence_storage_path=evidence_path,
+                evidence_public_url=evidence_public_url,
+                notes=f'Matched from stream {selected_url}',
+            )
+            db.add(detection)
+            db.commit()
+            logger.info('Detection stored for %s at %.3f', ad.name, best['confidence'])
+
+            try:
+                send_detection_email(report_email, ad.name, detected_at, best['confidence'], evidence_public_url)
+            except Exception as exc:
+                logger.exception('Detection email failed: %s', exc)
+    except Exception as exc:
+        logger.exception('Worker cycle failed: %s', exc)
+    finally:
+        db.close()
+
+
+def schedule_daily_report():
+    db = SessionLocal()
+    try:
+        send_yesterday_report(db)
+    except Exception as exc:
+        logger.exception('Daily report failed: %s', exc)
+    finally:
+        db.close()
+
+
+def main():
+    logger.info('Starting radio ad monitor worker...')
+    scheduler = BackgroundScheduler(timezone=settings.timezone)
+    scheduler.add_job(schedule_daily_report, 'cron', hour=settings.daily_report_hour, minute=0)
+    scheduler.start()
+
+    interval = max(3, settings.monitor_window_seconds - settings.monitor_overlap_seconds)
+    logger.info('Worker interval seconds: %s', interval)
+
+    while True:
+        process_once()
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    main()

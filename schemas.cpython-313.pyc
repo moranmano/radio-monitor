@@ -1,0 +1,9 @@
+from pydantic import BaseModel, EmailStr
+
+
+class SettingsUpdate(BaseModel):
+    report_email: EmailStr
+    stream_url: str
+    stream_backup_urls: str | None = None
+    match_threshold: float
+    dedup_minutes: int

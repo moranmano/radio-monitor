@@ -1,0 +1,40 @@
+from functools import lru_cache
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+
+    app_name: str = Field(default='Radio Ad Monitor', alias='APP_NAME')
+    app_env: str = Field(default='production', alias='APP_ENV')
+    secret_key: str = Field(alias='SECRET_KEY')
+    admin_password: str = Field(alias='ADMIN_PASSWORD')
+    base_url: str = Field(default='http://localhost:8000', alias='BASE_URL')
+    timezone: str = Field(default='Asia/Jerusalem', alias='TIMEZONE')
+    default_report_email: str = Field(default='moranmano@gmail.com', alias='DEFAULT_REPORT_EMAIL')
+    stream_url: str = Field(default='https://cdna.streamgates.net/TheBest/live/icecast.audio', alias='STREAM_URL')
+    stream_backup_urls: str = Field(default='', alias='STREAM_BACKUP_URLS')
+    database_url: str = Field(alias='DATABASE_URL')
+    supabase_url: str = Field(alias='SUPABASE_URL')
+    supabase_key: str = Field(alias='SUPABASE_KEY')
+    supabase_storage_bucket: str = Field(default='ad-files', alias='SUPABASE_STORAGE_BUCKET')
+    supabase_evidence_bucket: str = Field(default='evidence-files', alias='SUPABASE_EVIDENCE_BUCKET')
+    resend_api_key: str = Field(alias='RESEND_API_KEY')
+    resend_from_email: str = Field(alias='RESEND_FROM_EMAIL')
+    monitor_window_seconds: int = Field(default=12, alias='MONITOR_WINDOW_SECONDS')
+    monitor_overlap_seconds: int = Field(default=3, alias='MONITOR_OVERLAP_SECONDS')
+    match_threshold: float = Field(default=0.78, alias='MATCH_THRESHOLD')
+    dedup_minutes: int = Field(default=8, alias='DEDUP_MINUTES')
+    evidence_seconds_before: int = Field(default=5, alias='EVIDENCE_SECONDS_BEFORE')
+    evidence_seconds_after: int = Field(default=5, alias='EVIDENCE_SECONDS_AFTER')
+    daily_report_hour: int = Field(default=20, alias='DAILY_REPORT_HOUR')
+
+    @property
+    def backup_stream_urls(self) -> list[str]:
+        return [url.strip() for url in self.stream_backup_urls.split(',') if url.strip()]
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()

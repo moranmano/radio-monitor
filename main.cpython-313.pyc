@@ -1,0 +1,188 @@
+import json
+import uuid
+from pathlib import Path
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from sqlalchemy import desc, func, select
+from sqlalchemy.orm import Session
+
+from app.config import get_settings
+from app.database import get_db
+from app.models import Ad, Detection, SettingsModel
+from app.schemas import SettingsUpdate
+from app.services.audio_matcher import AudioMatcher
+from app.services.storage_service import extension_for, get_public_url, upload_bytes
+from app.utils.security import SESSION_KEY, require_login
+
+settings = get_settings()
+app = FastAPI(title=settings.app_name)
+app.add_middleware(SessionMiddleware, secret_key=settings.secret_key, same_site='lax')
+app.mount('/static', StaticFiles(directory='app/static'), name='static')
+templates = Jinja2Templates(directory='app/templates')
+matcher = AudioMatcher()
+
+
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+
+
+@app.get('/', response_class=HTMLResponse)
+def index(request: Request):
+    if request.session.get(SESSION_KEY):
+        return RedirectResponse('/dashboard', status_code=303)
+    return RedirectResponse('/login', status_code=303)
+
+
+@app.get('/login', response_class=HTMLResponse)
+def login_page(request: Request):
+    return templates.TemplateResponse('login.html', {'request': request, 'error': None})
+
+
+@app.post('/login', response_class=HTMLResponse)
+def login(request: Request, password: str = Form(...)):
+    if password == settings.admin_password:
+        request.session[SESSION_KEY] = True
+        return RedirectResponse('/dashboard', status_code=303)
+    return templates.TemplateResponse('login.html', {'request': request, 'error': 'סיסמה שגויה'})
+
+
+@app.get('/logout')
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse('/login', status_code=303)
+
+
+@app.get('/dashboard', response_class=HTMLResponse)
+def dashboard(request: Request, db: Session = Depends(get_db)):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    ads_count = db.scalar(select(func.count()).select_from(Ad)) or 0
+    detections_count = db.scalar(select(func.count()).select_from(Detection)) or 0
+    latest_detections = db.execute(select(Detection).order_by(desc(Detection.detected_at)).limit(10)).scalars().all()
+    settings_row = db.get(SettingsModel, 1)
+
+    return templates.TemplateResponse('dashboard.html', {
+        'request': request,
+        'ads_count': ads_count,
+        'detections_count': detections_count,
+        'latest_detections': latest_detections,
+        'settings_row': settings_row,
+    })
+
+
+@app.get('/ads', response_class=HTMLResponse)
+def ads_page(request: Request, db: Session = Depends(get_db)):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    ads = db.execute(select(Ad).order_by(desc(Ad.created_at))).scalars().all()
+    return templates.TemplateResponse('ads.html', {'request': request, 'ads': ads})
+
+
+@app.post('/ads/upload')
+async def upload_ad(
+    request: Request,
+    name: str = Form(...),
+    description: str = Form(default=''),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    raw = await file.read()
+    fingerprint = matcher.build_fingerprint(raw)
+    ext = extension_for(file.filename)
+    file_id = str(uuid.uuid4())
+    storage_path = f'ads/{file_id}{ext}'
+    upload_bytes(settings.supabase_storage_bucket, storage_path, raw, file.content_type or 'application/octet-stream')
+
+    ad = Ad(
+        name=name,
+        description=description or None,
+        original_filename=file.filename,
+        storage_path=storage_path,
+        duration_seconds=float(fingerprint['duration_seconds']),
+        fingerprint_json=fingerprint,
+        is_active=True,
+    )
+    db.add(ad)
+    db.commit()
+    return RedirectResponse('/ads', status_code=303)
+
+
+@app.post('/ads/{ad_id}/toggle')
+def toggle_ad(ad_id: str, request: Request, db: Session = Depends(get_db)):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+    ad = db.get(Ad, ad_id)
+    if ad:
+        ad.is_active = not ad.is_active
+        db.commit()
+    return RedirectResponse('/ads', status_code=303)
+
+
+@app.get('/detections', response_class=HTMLResponse)
+def detections_page(request: Request, db: Session = Depends(get_db)):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    rows = db.execute(select(Detection).order_by(desc(Detection.detected_at)).limit(500)).scalars().all()
+    return templates.TemplateResponse('detections.html', {'request': request, 'rows': rows})
+
+
+@app.get('/settings', response_class=HTMLResponse)
+def settings_page(request: Request, db: Session = Depends(get_db)):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    row = db.get(SettingsModel, 1)
+    return templates.TemplateResponse('settings.html', {'request': request, 'row': row})
+
+
+@app.post('/settings')
+def save_settings(
+    request: Request,
+    report_email: str = Form(...),
+    stream_url: str = Form(...),
+    stream_backup_urls: str = Form(default=''),
+    match_threshold: float = Form(...),
+    dedup_minutes: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    payload = SettingsUpdate(
+        report_email=report_email,
+        stream_url=stream_url,
+        stream_backup_urls=stream_backup_urls,
+        match_threshold=match_threshold,
+        dedup_minutes=dedup_minutes,
+    )
+
+    row = db.get(SettingsModel, 1)
+    if row is None:
+        row = SettingsModel(id=1)
+        db.add(row)
+
+    row.report_email = payload.report_email
+    row.stream_url = payload.stream_url
+    row.stream_backup_urls = payload.stream_backup_urls
+    row.match_threshold = payload.match_threshold
+    row.dedup_minutes = payload.dedup_minutes
+    db.commit()
+
+    return RedirectResponse('/settings', status_code=303)
